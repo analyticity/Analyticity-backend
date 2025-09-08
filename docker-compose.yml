@@ -1,0 +1,20 @@
+version: "3.9"
+
+services:
+  analyticity-backend:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./AnalyticityBackend:/app/AnalyticityBackend
+    restart: always
+    networks:
+      - analyticity-network
+    environment:
+      DB_BRNO_HOST: timescaledb_brno
+      DB_JMK_HOST: timescaledb_jmk
+      DB_ORPMOST_HOST: timescaledb_orp_most
+
+networks:
+  analyticity-network:
+    external: true
