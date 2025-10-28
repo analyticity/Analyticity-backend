@@ -1,16 +1,43 @@
 QUERY_SUM_STATISTICS = """
-    SELECT 
-        SUM(total_active_jams) AS data_jams,
-        SUM(total_active_alerts) AS data_alerts,
-        AVG(avg_speed_kmh)::FLOAT AS speedKMH,
-        AVG(avg_delay)::FLOAT AS delay,
-        AVG(avg_jam_level)::FLOAT AS level,
-        AVG(avg_jam_length)::FLOAT AS length,
-        stat_time AT TIME ZONE 'UTC' AS utc_time
-    FROM sum_statistics
-    WHERE stat_time >= %s AND stat_time < %s
-    GROUP BY stat_time AT TIME ZONE 'UTC'
-    ORDER BY utc_time
+WITH hours AS (
+    SELECT generate_series(
+        date_trunc('hour', %s::timestamptz),
+        date_trunc('hour', %s::timestamptz) - interval '1 hour',
+        interval '1 hour'
+    ) AS utc_time
+),
+jams_agg AS (
+    SELECT
+        date_trunc('hour', published_at AT TIME ZONE 'UTC') AS utc_time,
+        COUNT(*)                          AS data_jams,
+        AVG(speed_kmh)::FLOAT             AS speedKMH,
+        AVG(delay)::FLOAT                 AS delay,
+        AVG(jam_level)::FLOAT             AS level,
+        AVG(jam_length)::FLOAT            AS length
+    FROM jams
+    WHERE published_at >= %s AND published_at < %s
+    GROUP BY utc_time
+),
+alerts_agg AS (
+    SELECT
+        date_trunc('hour', published_at AT TIME ZONE 'UTC') AS utc_time,
+        COUNT(*)                          AS data_alerts
+    FROM alerts
+    WHERE published_at >= %s AND published_at < %s
+    GROUP BY utc_time
+)
+SELECT
+    j.data_jams,
+    j.speedKMH,
+    j.delay,
+    j.level,
+    j.length,
+    h.utc_time,
+    COALESCE(a.data_alerts, 0)            AS data_alerts
+FROM hours h
+LEFT JOIN jams_agg   j USING (utc_time)
+LEFT JOIN alerts_agg a USING (utc_time)
+ORDER BY h.utc_time;
 """
 
 QUERY_SUM_STATISTICS_WITH_STREETS = """
@@ -111,7 +138,7 @@ QUERY_JAMS = """
     SELECT
         uuid,
         street,
-        ST_AsText(jam_line::geometry) AS wkt,
+        ST_AsEWKB(jam_line::geometry) AS wkb,
         jam_level,
         delay,
         published_at
@@ -142,4 +169,129 @@ QUERY_TOP_N_ROUTE = """
         GROUP BY street
         ORDER BY count DESC
         LIMIT %s;
+"""
+
+QUERY_TOTAL_STATISTICS = """
+SELECT
+    COUNT(*) AS data_jams,
+    COALESCE(AVG(speed_kmh)::FLOAT, 35.0)              AS speedKMH,  -- km/h
+    COALESCE(SUM(delay)::FLOAT / 60.0, 0.0)            AS delay,     -- minutes
+    COALESCE(AVG(jam_level)::FLOAT, 0.0)               AS level,
+    COALESCE(SUM(jam_length)::FLOAT / 1000.0, 0.0)     AS length,    -- km
+    (
+        SELECT COUNT(*)
+        FROM alerts
+        WHERE published_at >= %s AND published_at < %s
+    ) AS data_alerts
+FROM jams
+WHERE published_at >= %s AND published_at < %s;
+"""
+
+# (B) Filtrovanie podľa ulíc (uprav, ak máš iný názov stĺpca ako "street")
+QUERY_TOTAL_STATISTICS_WITH_STREETS = """
+SELECT
+    COUNT(*) AS data_jams,
+    COALESCE(AVG(speed_kmh)::FLOAT, 35.0)              AS speedKMH,
+    COALESCE(AVG(delay)::FLOAT / 60.0, 0.0)            AS delay,
+    COALESCE(AVG(jam_level)::FLOAT, 0.0)               AS level,
+    COALESCE(AVG(jam_length)::FLOAT / 1000.0, 0.0)     AS length,
+    (
+        SELECT COUNT(*)
+        FROM alerts
+        WHERE published_at >= %s AND published_at < %s
+          AND street = ANY(%s)
+    ) AS data_alerts
+FROM jams
+WHERE published_at >= %s AND published_at < %s
+  AND street = ANY(%s);
+"""
+
+# (C) Filtrovanie podľa trasy (predpoklad: geom v SRID 4326). Zmeň názvy stĺpcov/SRID ak treba.
+QUERY_TOTAL_STATISTICS_WITH_ROUTE = """
+WITH route AS (
+    SELECT ST_GeomFromText(%s, 4326) AS geom
+)
+SELECT
+    COUNT(*) AS data_jams,
+    COALESCE(AVG(j.speed_kmh)::FLOAT, 35.0)              AS speedKMH,
+    COALESCE(AVG(j.delay)::FLOAT / 60.0, 0.0)            AS delay,
+    COALESCE(AVG(j.jam_level)::FLOAT, 0.0)               AS level,
+    COALESCE(AVG(j.jam_length)::FLOAT / 1000.0, 0.0)     AS length,
+    (
+        SELECT COUNT(*)
+        FROM alerts a, route r
+        WHERE a.published_at >= %s AND a.published_at < %s
+          AND ST_Intersects(a.geom, r.geom)
+    ) AS data_alerts
+FROM jams j, route r
+WHERE j.published_at >= %s AND j.published_at < %s
+  AND ST_Intersects(j.geom, r.geom);
+"""
+
+QUERY_ALERTS_TYPES_BASE = """
+SELECT
+  a.type,
+  COALESCE(NULLIF(a.subtype, ''), 'NOT_DEFINED') AS subtype,
+  COUNT(*)::BIGINT AS count
+FROM alerts a
+WHERE a.published_at >= %s AND a.published_at < %s
+GROUP BY a.type, COALESCE(NULLIF(a.subtype, ''), 'NOT_DEFINED');
+"""
+
+# Optional filter by streets (alerts.street = ANY($3))
+QUERY_ALERTS_TYPES_WITH_STREETS = """
+SELECT
+  a.type,
+  COALESCE(NULLIF(a.subtype, ''), 'NOT_DEFINED') AS subtype,
+  COUNT(*)::BIGINT AS count
+FROM alerts a
+WHERE a.published_at >= %s AND a.published_at < %s
+  AND a.street = ANY(%s)
+GROUP BY a.type, COALESCE(NULLIF(a.subtype, ''), 'NOT_DEFINED');
+"""
+
+# JAMS: top-N streets in interval (drop NULL/empty streets)
+QUERY_TOP_STREETS_JAMS_BASE = """
+SELECT j.street, COUNT(*)::BIGINT AS cnt
+FROM jams j
+WHERE j.published_at >= %s AND j.published_at < %s
+  AND NULLIF(TRIM(j.street), '') IS NOT NULL
+GROUP BY j.street
+ORDER BY cnt DESC, j.street ASC
+LIMIT %s;
+"""
+
+# JAMS with explicit streets allowlist
+QUERY_TOP_STREETS_JAMS_WITH_STREETS = """
+SELECT j.street, COUNT(*)::BIGINT AS cnt
+FROM jams j
+WHERE j.published_at >= %s AND j.published_at < %s
+  AND j.street = ANY(%s)
+  AND NULLIF(TRIM(j.street), '') IS NOT NULL
+GROUP BY j.street
+ORDER BY cnt DESC, j.street ASC
+LIMIT %s;
+"""
+
+# ALERTS: top-N streets in interval (drop NULL/empty streets)
+QUERY_TOP_STREETS_ALERTS_BASE = """
+SELECT a.street, COUNT(*)::BIGINT AS cnt
+FROM alerts a
+WHERE a.published_at >= %s AND a.published_at < %s
+  AND NULLIF(TRIM(a.street), '') IS NOT NULL
+GROUP BY a.street
+ORDER BY cnt DESC, a.street ASC
+LIMIT %s;
+"""
+
+# ALERTS with explicit streets allowlist
+QUERY_TOP_STREETS_ALERTS_WITH_STREETS = """
+SELECT a.street, COUNT(*)::BIGINT AS cnt
+FROM alerts a
+WHERE a.published_at >= %s AND a.published_at < %s
+  AND a.street = ANY(%s)
+  AND NULLIF(TRIM(a.street), '') IS NOT NULL
+GROUP BY a.street
+ORDER BY cnt DESC, a.street ASC
+LIMIT %s;
 """

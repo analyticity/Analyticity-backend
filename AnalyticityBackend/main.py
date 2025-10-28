@@ -1,13 +1,14 @@
-from fastapi import FastAPI, HTTPException
-import psycopg2
-from psycopg2.extras import RealDictCursor
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.gzip import GZipMiddleware
 
-from db_config import get_db_connection
-from routers import homepage_endpoints, alerts_endpoints, jams_endpoints, plot_endpoints
+from logging_config import setup_logging
+from middleware.request_logging import request_logging_middleware
 
+from routers import homepage_endpoints, alerts_endpoints, jams_endpoints, plot_endpoints, health_endpoints,\
+    dashboard_endpoints
 
-############################################################################################
+logger = setup_logging()
 
 app = FastAPI()
 
@@ -15,6 +16,8 @@ app.include_router(homepage_endpoints.router)
 app.include_router(alerts_endpoints.router)
 app.include_router(jams_endpoints.router)
 app.include_router(plot_endpoints.router)
+app.include_router(health_endpoints.router)
+app.include_router(dashboard_endpoints.router)
 
 
 app.add_middleware(
@@ -24,33 +27,9 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"]
 )
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 
-@app.get("/{name}/alerts/")
-async def get_alerts(name: str):
-    # Connect to the specific database
-    connection = get_db_connection(name)
-
-    try:
-        cursor = connection.cursor(cursor_factory=RealDictCursor)
-
-        # Define your SQL query to fetch alerts
-        query = "SELECT * FROM alerts;"  # Assuming your alerts table is named 'alerts'
-
-        # Execute the query
-        cursor.execute(query)
-        alerts = cursor.fetchall()
-
-        if not alerts:
-            raise HTTPException(status_code=404, detail="No alerts found")
-
-        return {"alerts": alerts}
-
-    except psycopg2.Error as e:
-        raise HTTPException(status_code=500, detail=f"Query execution error: {e}")
-
-    finally:
-        # Always close the connection and cursor
-        if connection:
-            cursor.close()
-            connection.close()
+@app.middleware("http")
+async def _request_logger(request, call_next):
+    return await request_logging_middleware(request, call_next)

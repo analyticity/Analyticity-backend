@@ -1,52 +1,348 @@
+import binascii
+import logging
+import time
+from typing import Optional, List
+
 import numpy as np
+import pandas as pd
+from fastapi import APIRouter, HTTPException
+
+import geopandas as gpd
+from shapely import wkt
+from shapely import from_wkb
+from shapely.strtree import STRtree
+from shapely.errors import GEOSException
+from shapely.geometry.base import BaseGeometry
+from shapely.prepared import prep
 
 
-GREEN_COLOR = 2
-ORANGE_COLOR = 5
+def _filter_streets(streets_gdf: gpd.GeoDataFrame, streets: List[str]) -> gpd.GeoDataFrame:
+    """Filter streets by names safely; if empty list, return all."""
+    if not streets:
+        return streets_gdf
+    return streets_gdf[streets_gdf["nazev"].isin(streets)].copy()
 
 
-def assign_color(df, num_days=7):
-    df['color'] = np.select(
-        [
-            df['count'] < GREEN_COLOR * num_days,
-            (df['count'] >= GREEN_COLOR * num_days) & (df['count'] <= ORANGE_COLOR * num_days),
-            df['count'] > ORANGE_COLOR * num_days
-        ],
-        ['green', 'orange', 'red'],
-        default='green'
-    )
-    return df
+def _parse_wkb_any(v) -> Optional["BaseGeometry"]:
+    """
+    Robustly parse WKB coming from Postgres (bytea) regardless of adaptation:
+    - bytes / memoryview  -> direct
+    - str starting with '\\x' (hex) -> unhexlify
+    - None / empty -> returns None
+    Raises GEOSException only if content looks like bytes but is invalid.
+    """
+    if v is None:
+        return None
+    try:
+        if isinstance(v, memoryview):
+            v = bytes(v)
+        if isinstance(v, bytes):
+            if len(v) == 0:
+                return None
+            return from_wkb(v)
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return None
+            # Hex text representation of bytea: '\xDEADBEEF...'
+            if s.startswith("\\x") or s.startswith("\x5c\x78"):  # defensive
+                try:
+                    raw = binascii.unhexlify(s[2:])
+                except binascii.Error as e:
+                    raise GEOSException(f"Invalid HEX WKB: {e}") from e
+                return from_wkb(raw)
+            # As a last resort, some drivers may accidentally send WKT in 'wkb' column
+            # Try WKT parse to avoid hard failure:
+            try:
+                return wkt.loads(s)
+            except Exception:
+                raise GEOSException("String is neither HEX WKB nor WKT.")
+        # Unknown type
+        raise GEOSException(f"Unsupported WKB type: {type(v)}")
+    except GEOSException:
+        raise
+    except Exception as e:
+        # Normalize unexpected errors into GEOSException to handle upstream uniformly
+        raise GEOSException(str(e)) from e
 
 
-def count_delays_by_parts(street_gdf, jam_data):
-    for index, row in street_gdf.iterrows():
-        street_name = row['nazev']
-        geom = row['geometry']
-        relevant_jams = jam_data[jam_data['street'] == street_name]
+def _build_jams_gdf(rows: list, logger) -> gpd.GeoDataFrame:
+    """
+    Create a GeoDataFrame from DB rows.
+    Prefers 'wkb' (bytea) but accepts 'wkt' fallback.
+    Skips invalid/NULL geometries with warnings instead of crashing.
+    """
+    if not rows:
+        return gpd.GeoDataFrame(columns=["street", "geometry"], geometry="geometry", crs="EPSG:4326")
 
-        count = sum(geom.intersects(jam_geom) for jam_geom in relevant_jams['geometry'])
-        street_gdf.at[index, 'count'] = count
+    df = pd.DataFrame(rows)
 
-    if street_gdf.empty:
-        jam_data['count'] = 0
-        return assign_color(jam_data)
+    geoms = []
+    skipped = 0
+    first_err_sample = None
+
+    if "wkb" in df.columns:
+        for v in df["wkb"].tolist():
+            try:
+                geom = _parse_wkb_any(v)
+                if geom is None:
+                    skipped += 1
+                geoms.append(geom)
+            except GEOSException as e:
+                skipped += 1
+                if first_err_sample is None:
+                    first_err_sample = (type(v).__name__, str(e))
+                geoms.append(None)
+    elif "wkt" in df.columns:
+        for v in df["wkt"].tolist():
+            try:
+                if v is None or str(v).strip() == "":
+                    skipped += 1
+                    geoms.append(None)
+                else:
+                    geoms.append(wkt.loads(v))
+            except Exception as e:
+                skipped += 1
+                if first_err_sample is None:
+                    first_err_sample = ("str", str(e))
+                geoms.append(None)
     else:
-        return assign_color(street_gdf)
+        raise HTTPException(status_code=500, detail="Missing geometry column (expected 'wkb' or 'wkt').")
+
+    if skipped:
+        logger.warning(
+            f"[jams] Skipped {skipped} invalid/NULL geometries while parsing jams"
+            + (f"; first_error={first_err_sample}" if first_err_sample else ""),
+            extra={"request_id": "", "path": "/parse", "method": "INTERNAL"},
+        )
+
+    df["geometry"] = geoms
+    gdf = gpd.GeoDataFrame(df[df["geometry"].notnull()].copy(), geometry="geometry", crs="EPSG:4326")
+
+    if gdf.empty:
+        logger.warning(
+            "[jams] All geometries were NULL/invalid after parsing.",
+            extra={"request_id": "", "path": "/parse", "method": "INTERNAL"},
+        )
+
+    return gdf
+
+# nastaviteľná tolerancia v metroch
+TOLERANCE_M = 15  # tip: 10–20 m funguje dobre v meste
+PROJECTED_CRS = "EPSG:3857"  # metrické; alebo CZ presne: "EPSG:5514"
 
 
-def get_street_path(street_gdf, jams_gdf, street=None, from_time=None, to_time=None):
-    df_streets = street_gdf[street_gdf['nazev'] == street] if street else street_gdf
+def _count_with_strtree_tolerant(street_gdf: gpd.GeoDataFrame,
+                                 jams_gdf: gpd.GeoDataFrame,
+                                 logger=None,
+                                 tol_m: float = TOLERANCE_M) -> gpd.GeoDataFrame:
+    """
+    Count jams within a tolerance (in meters) around each street.
+    Uses Shapely STRtree and prepared geometries.
+    Handles invalid geometries and NaN values gracefully.
+    """
 
-    df_count = count_delays_by_parts(df_streets, jams_gdf)
+    # --- make sure tolerance is float ---
+    try:
+        tol_m = float(tol_m)
+    except Exception:
+        tol_m = TOLERANCE_M
+        if logger:
+            logger.warning(f"[jams] Invalid tolerance input; defaulting to {TOLERANCE_M}m")
 
-    street_geometry_dict = []
-    for _, row in df_count.iterrows():
-        coords = list(row['geometry'].coords)
-        final_dict = {
-            'street_name': row['nazev'],
-            'path': [[lon, lat] for lon, lat in coords],
-            'color': row['color']
-        }
-        street_geometry_dict += [final_dict]
+    if tol_m <= 0:
+        if logger:
+            logger.warning("[jams] Non-positive tolerance; forcing to 1m")
+        tol_m = 1.0
 
-    return street_geometry_dict
+    if street_gdf.empty or jams_gdf.empty:
+        out = street_gdf.copy()
+        out["count"] = 0
+        return out
+
+    sg = street_gdf.copy()
+    jg = jams_gdf.copy()
+
+    # ensure CRS
+    if sg.crs is None:
+        sg.set_crs("EPSG:4326", inplace=True)
+    if jg.crs is None:
+        jg.set_crs("EPSG:4326", inplace=True)
+
+    # project to metric CRS
+    if sg.crs.to_string() != PROJECTED_CRS:
+        sg = sg.to_crs(PROJECTED_CRS)
+    if jg.crs.to_string() != PROJECTED_CRS:
+        jg = jg.to_crs(PROJECTED_CRS)
+
+    # validate geometries (no NaN, None, empty)
+    def _valid(g):
+        if g is None or not isinstance(g, BaseGeometry):
+            return False
+        if g.is_empty:
+            return False
+        coords = np.array(g.coords) if hasattr(g, "coords") else None
+        if coords is not None and not np.isfinite(coords).all():
+            return False
+        return True
+
+    sg = sg[sg["geometry"].apply(_valid)].copy()
+    jg = jg[jg["geometry"].apply(_valid)].copy()
+
+    if sg.empty or jg.empty:
+        out = street_gdf.copy()
+        out["count"] = 0
+        return out
+
+    # build spatial index
+    jam_geoms = jg["geometry"].tolist()
+    sindex = STRtree(jam_geoms)
+
+    counts = []
+    for geom in sg["geometry"]:
+        if not _valid(geom):
+            counts.append(0)
+            continue
+
+        try:
+            # expand search area slightly (tolerance)
+            search_env = geom.buffer(float(tol_m)).envelope
+        except Exception as e:
+            if logger:
+                logger.warning(f"[jams] Failed buffering geometry: {e}")
+            counts.append(0)
+            continue
+
+        # candidate geometries from index
+        cand = sindex.query(search_env)
+
+        # prepare geometry for fast intersection
+        prepped = prep(geom.buffer(float(tol_m)))
+        c = 0
+        for g in cand:
+            if _valid(g) and prepped.intersects(g):
+                c += 1
+        counts.append(c)
+
+    out = sg.copy()
+    out["count"] = counts
+
+    # reproject back to EPSG:4326 if needed
+    if out.crs.to_string() != street_gdf.crs.to_string():
+        out = out.to_crs(street_gdf.crs)
+
+    return out
+
+
+import geopandas as gpd
+from shapely.strtree import STRtree
+from shapely.geometry import LineString, MultiLineString
+from shapely.ops import transform
+import pyproj
+
+
+def count_delays_by_parts(gdf: gpd.GeoDataFrame, data: gpd.GeoDataFrame, tolerance_m: float = 10):
+    """
+    Count how many jam geometries (data) intersect each street (gdf) using STRtree for speed,
+    but respecting street names and allowing small spatial tolerance in meters.
+    """
+
+    if gdf.empty or data.empty:
+        gdf["count"] = 0
+        return _assign_color(gdf)
+
+    # --- prepare projection to metric CRS (so we can buffer in meters) ---
+    to_m = pyproj.Transformer.from_crs("EPSG:4326", "EPSG:3857", always_xy=True).transform
+    to_deg = pyproj.Transformer.from_crs("EPSG:3857", "EPSG:4326", always_xy=True).transform
+
+    gdf_m = gdf.copy()
+    gdf_m["geometry"] = gdf_m["geometry"].apply(lambda g: transform(to_m, g))
+
+    data_m = data.copy()
+    data_m["geometry"] = data_m["geometry"].apply(lambda g: transform(to_m, g))
+
+    # --- build STRtree once for jams ---
+    jam_geoms = data_m["geometry"].tolist()
+    jam_index = STRtree(jam_geoms)
+
+    # map jam geometry → street name for filtering
+    jam_name_map = {row["geometry"]: row["street"] for _, row in data_m.iterrows()}
+
+    counts = []
+
+    for idx, street_row in gdf_m.iterrows():
+        street_name = street_row["nazev"]
+        street_geom = street_row["geometry"]
+
+        if street_geom is None or street_geom.is_empty:
+            counts.append(0)
+            continue
+
+        # expand street geometry by tolerance (in meters)
+        street_buffer = street_geom.buffer(tolerance_m)
+
+        # candidate jams by bounding box match
+        candidates = jam_index.query(street_buffer)
+
+        # count only jams with the same street name
+        c = 0
+        for cand_geom in candidates:
+            if jam_name_map.get(cand_geom) != street_name:
+                continue
+            # final precise check
+            if street_buffer.intersects(cand_geom):
+                c += 1
+
+        counts.append(c)
+
+    # store results
+    gdf_m["count"] = counts
+
+    # reproject back to EPSG:4326 (WGS84)
+    gdf_m["geometry"] = gdf_m["geometry"].apply(lambda g: transform(to_deg, g))
+
+    return _assign_color(gdf_m)
+
+
+def _assign_color(count: int, num_days: int = 7) -> str:
+    """
+    Apply your color thresholds inline (same logic as in your helper).
+    - Keep thresholds compatible with your existing FE expectations.
+    """
+    GREEN_COLOR = 1
+    ORANGE_COLOR = 3
+    if count < GREEN_COLOR * num_days:
+        return "green"
+    if count <= ORANGE_COLOR * num_days:
+        return "orange"
+    return "red"
+
+
+def _serialize_street_paths(df_streets: gpd.GeoDataFrame) -> list:
+    """
+    Serialize to your existing output format:
+    [{ 'street_name': ..., 'path': [[lon, lat], ...], 'color': ... }, ...]
+    """
+    out = []
+    for _, row in df_streets.iterrows():
+        geom = row["geometry"]
+        if row["count"] > 0:
+            print(row)
+        if geom is None:
+            continue
+        # Support LineString and MultiLineString
+        if geom.geom_type == "LineString":
+            coords = list(geom.coords)
+        elif geom.geom_type == "MultiLineString":
+            coords = [xy for line in geom.geoms for xy in line.coords]
+        else:
+            continue
+        out.append(
+            {
+                "street_name": row.get("nazev"),
+                # Leaflet expects [lat, lon] instead of [lon, lat]
+                "path": [[lat, lon] for lon, lat in coords],
+                "color": row.get("color", "green"),
+            }
+        )
+    return out

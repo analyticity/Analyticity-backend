@@ -1,5 +1,7 @@
 from pydantic import BaseModel, Field
 from datetime import datetime
+from typing import List
+
 
 class Stats(BaseModel):
     jams: int = Field(..., description="Number of traffic jams")
@@ -29,3 +31,22 @@ class StatsResponse(BaseModel):
             }
         }
     }
+
+
+class LegacyPlotResponse(BaseModel):
+    jams: List[int]
+    alerts: List[int]
+    speedKMH: List[float]
+    delay: List[float]
+    level: List[float]
+    length: List[float]
+    xaxis: List[int]
+
+
+class TotalStatsResponse(BaseModel):
+    data_jams: int
+    data_alerts: int
+    speedKMH: float
+    delay: float
+    level: float
+    length: float

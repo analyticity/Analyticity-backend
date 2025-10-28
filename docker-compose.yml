@@ -13,7 +13,7 @@ services:
     environment:
       DB_BRNO_HOST: timescaledb_brno
       DB_JMK_HOST: timescaledb_jmk
-      DB_ORPMOST_HOST: timescaledb_orp_most
+      DB_ORP_MOST_HOST: timescaledb_orp_most
 
 networks:
   analyticity-network:
